@@ -166,6 +166,7 @@ class UIBridge:
         deadline = time.time() + timeout
         stable_since = None
         last_text = ""
+        last_click = 0.0
         # Wait for the assistant bubble to appear, then stabilize.
         while time.time() < deadline:
             state = await page.evaluate(
@@ -181,6 +182,22 @@ class UIBridge:
                 }""")
             txt = (state.get("text") or "").strip()
             if txt:
+                low = txt.lower()
+                if ("waiting for verification" in low or "verify" in low) and len(txt) < 80:
+                    # The site popped its Turnstile modal — click the checkbox
+                    # inside the CF iframe until it clears (throttled).
+                    now = time.time()
+                    if now - last_click > 2.5:
+                        last_click = now
+                        try:
+                            fl = page.frame_locator(
+                                "iframe[title='Widget containing a Cloudflare security challenge'], "
+                                "iframe[src*='challenges.cloudflare.com']")
+                            await fl.locator("input[type='checkbox']").first.click(timeout=2000)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.6)
+                    continue
                 if txt == last_text:
                     if stable_since is None:
                         stable_since = time.time()
@@ -189,6 +206,18 @@ class UIBridge:
                 else:
                     last_text = txt
                     stable_since = None
+            else:
+                # challenge may appear before any bubble text — try the modal too
+                now = time.time()
+                if now - last_click > 2.5:
+                    last_click = now
+                    try:
+                        fl = page.frame_locator(
+                            "iframe[title='Widget containing a Cloudflare security challenge'], "
+                            "iframe[src*='challenges.cloudflare.com']")
+                        await fl.locator("input[type='checkbox']").first.click(timeout=1500)
+                    except Exception:
+                        pass
             await asyncio.sleep(0.6)
         if last_text:
             return last_text  # best effort: return what we have
