@@ -15,7 +15,7 @@ public HTTP proxies gives each upstream call a fresh IP. This module:
               the server rotates on every upstream call and cools down proxies
               that get rate-limited (429) or fail to connect.
 
-Use as a library (`ProxyPool`) or CLI:
+Use as a library (`ProxyPool`, `AutoRefresher`) or CLI:
 
   python3 proxy_pool.py --scrape --check --limit 300 --concurrency 64 \
       --stage2-sample 20 --out proxies.json
@@ -23,6 +23,10 @@ Use as a library (`ProxyPool`) or CLI:
   python3 proxy_pool.py --stats --out proxies.json
 
 Env (server side): PROXY_POOL=1 PROXY_POOL_FILE=proxies.json
+Auto-refresh (server runs its own scrape+check when the pool runs low):
+  PROXY_POOL_AUTO=1 PROXY_POOL_REFRESH_SECS=900 PROXY_POOL_MIN_AVAIL=3
+  PROXY_POOL_SCRAPE_LIMIT=200 PROXY_POOL_CHECK_CONCURRENCY=32
+  PROXY_POOL_STAGE2_SAMPLE=5
 
 Be a good citizen: modest concurrency, short timeouts, and the checker touches
 oxalpha.com at most `stage2-sample` times per run.
@@ -32,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -42,6 +47,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Iterable
+
+log = logging.getLogger("proxy_pool")
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
@@ -301,6 +308,146 @@ class ProxyPool:
                                if k in old})
                 merged.update({k: rec[k] for k in ("state", "latency_ms")})
                 self._records[rec["proxy"]] = merged
+
+    def prune(self, max_records: int = 300) -> int:
+        """Cap pool size so long-lived instances don't grow unbounded.
+        'down' records are evicted first, then least-successful ones.
+        Returns the number of records removed."""
+        with self._lock:
+            if len(self._records) <= max_records:
+                return 0
+            recs = list(self._records.values())
+
+            def score(r: dict) -> tuple:
+                return (0 if r.get("state") == "down" else 1,   # down evicted first
+                        r.get("ok", 0),                          # then fewer oks
+                        -r.get("latency_ms", 0))                 # then slowest
+
+            recs.sort(key=score, reverse=True)
+            keep = {r["proxy"] for r in recs[:max_records]}
+            removed = [p for p in self._records if p not in keep]
+            for p in removed:
+                del self._records[p]
+            return len(removed)
+
+
+# ------------------------------------------------------- auto refresher ------
+
+class AutoRefresher:
+    """Background self-maintenance for a ProxyPool.
+
+    Every `interval` seconds (or immediately when woken, e.g. after upstream
+    429s or pool exhaustion) it checks whether usable proxies dipped below
+    `min_avail`; if so it scrapes a fresh batch, checks it, merges it into the
+    pool and prunes it back to size.
+
+    Fallback discipline (this runs unattended on Render):
+      - runs in a daemon thread — requests NEVER wait on it
+      - single-flight: overlapping wakes/ticks collapse into one run
+      - any failure (network, source down, bad data) is logged and retried
+        next tick; the pool keeps whatever it had
+      - an empty pool is fine: the server falls back to a direct connection
+      - memory-safe: prune() caps total records
+    """
+
+    def __init__(self, pool: ProxyPool, interval: float = 900.0,
+                 min_avail: int = 3, limit: int = 200, concurrency: int = 32,
+                 stage2_sample: int = 5, max_records: int = 300,
+                 log_: logging.Logger | None = None):
+        self.pool = pool
+        self.interval = max(60.0, float(interval))  # floor: don't hammer sources
+        self.min_avail = min_avail
+        self.limit = limit
+        self.concurrency = concurrency
+        self.stage2_sample = stage2_sample
+        self.max_records = max_records
+        self._logger = log_ or log
+        self._wake = threading.Event()
+        self._force = False
+        self._running = False
+        self._single = threading.Lock()
+        self._last_run = 0.0
+        self._last_result = "never run"
+        self._runs = 0
+        self._refreshes = 0
+
+    def start(self) -> "AutoRefresher":
+        threading.Thread(target=self._loop, daemon=True,
+                         name="proxy-refresher").start()
+        return self
+
+    def wake(self) -> None:
+        """Ask for a refresh at the next opportunity (forced, ignores threshold)."""
+        self._force = True
+        self._wake.set()
+
+    def _loop(self) -> None:
+        self._logger.info("proxy auto-refresher started (interval=%ss, min_avail=%d)",
+                          self.interval, self.min_avail)
+        while True:
+            self._wake.wait(timeout=self.interval)
+            self._wake.clear()
+            force = self._force
+            self._force = False
+            try:
+                self._run_once(force=force)
+            except Exception as e:  # the loop itself must never die
+                self._last_result = f"error: {e}"
+                self._logger.warning("proxy auto-refresh error: %s", e)
+
+    def _run_once(self, force: bool = False) -> None:
+        if self._running:
+            return
+        st = self.pool.stats()
+        if not force and st["available_now"] >= self.min_avail:
+            self._last_run = time.time()
+            self._last_result = f"skipped (pool healthy: {st['available_now']} avail)"
+            return
+        with self._single:
+            if self._running:
+                return
+            self._running = True
+        t0 = time.time()
+        try:
+            proxies = scrape(limit=self.limit, timeout=12)
+            if not proxies:
+                self._last_result = f"no proxies scraped ({time.time() - t0:.0f}s)"
+                self._logger.warning("proxy auto-refresh: %s", self._last_result)
+                return
+            checked = check(proxies, self.concurrency, self.stage2_sample,
+                            progress=False)
+            if checked:
+                self.pool.build_records(checked)
+                self.pool.prune(max_records=self.max_records)
+                try:
+                    self.pool.save()
+                except Exception as e:
+                    self._logger.warning("proxy pool save failed (memory still "
+                                         "updated): %s", e)
+                n_ok = sum(1 for r in checked if r["state"] == "ok")
+                self._refreshes += 1
+                self._last_result = (f"merged {len(checked)} stage-1 survivors "
+                                     f"({n_ok} reach upstream) in "
+                                     f"{time.time() - t0:.0f}s")
+                self._logger.info("proxy auto-refresh: %s", self._last_result)
+            else:
+                self._last_result = "no survivors this round (pool unchanged)"
+                self._logger.warning("proxy auto-refresh: %s", self._last_result)
+        finally:
+            self._running = False
+            self._runs += 1
+            self._last_run = time.time()
+
+    def status(self) -> dict:
+        return {"enabled": True, "interval_s": self.interval,
+                "min_avail": self.min_avail, "scrape_limit": self.limit,
+                "concurrency": self.concurrency,
+                "stage2_sample": self.stage2_sample,
+                "runs": self._runs, "refreshes": self._refreshes,
+                "running": self._running,
+                "last_run_ago_s": (round(time.time() - self._last_run, 1)
+                                   if self._last_run else None),
+                "last_result": self._last_result}
 
 
 # ---------------------------------------------------------------- CLI --------

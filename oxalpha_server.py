@@ -92,6 +92,16 @@ SOLVER_TIMEOUT = float(os.environ.get("SOLVER_TIMEOUT", "150"))
 PROXY_POOL_ENABLED = os.environ.get("PROXY_POOL", "0").lower() in ("1", "true", "yes")
 PROXY_POOL_FILE = os.environ.get("PROXY_POOL_FILE", "proxies.json")
 
+# Self-maintenance: when the pool runs low the server scrapes + checks a fresh
+# batch in a background thread (never blocks requests; direct fallback covers
+# gaps while it works).
+PROXY_POOL_AUTO = os.environ.get("PROXY_POOL_AUTO", "1").lower() in ("1", "true", "yes")
+PROXY_POOL_REFRESH_SECS = float(os.environ.get("PROXY_POOL_REFRESH_SECS", "900"))
+PROXY_POOL_MIN_AVAIL = int(os.environ.get("PROXY_POOL_MIN_AVAIL", "3"))
+PROXY_POOL_SCRAPE_LIMIT = int(os.environ.get("PROXY_POOL_SCRAPE_LIMIT", "200"))
+PROXY_POOL_CHECK_CONCURRENCY = int(os.environ.get("PROXY_POOL_CHECK_CONCURRENCY", "32"))
+PROXY_POOL_STAGE2_SAMPLE = int(os.environ.get("PROXY_POOL_STAGE2_SAMPLE", "5"))
+
 DEBUG = os.environ.get("OXA_DEBUG", "0").lower() in ("1", "true", "yes")
 
 logging.basicConfig(
@@ -186,6 +196,7 @@ def _throttle() -> None:
 POOL = ppool.ProxyPool(PROXY_POOL_FILE, enabled=PROXY_POOL_ENABLED)
 if PROXY_POOL_ENABLED:
     POOL.load()
+REFRESHER: ppool.AutoRefresher | None = None  # started in main(), not at import
 
 _ssl_ctx = ssl.create_default_context()
 PROXY_CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "8"))
@@ -283,6 +294,20 @@ def _mint_token() -> str:
         }) from e
 
 
+def _session_refresh_resilient(proxy: str | None) -> None:
+    """Force-refresh the session, falling back to a direct fetch when the
+    proxied refresh fails (session endpoints must never hard-fail a request
+    that could still be served via another route)."""
+    try:
+        SESSION.get(force=True, proxy=proxy)
+    except UpstreamError as e:
+        if not proxy:
+            raise
+        log.warning("session refresh via %s failed: %s — trying direct",
+                    proxy, str(e)[:120])
+        SESSION.get(force=True, proxy=None)
+
+
 def upstream_stream(messages: list[dict], turnstile_token: str | None = None
                     ) -> Generator[tuple[str, Any], None, None]:
     """POST /api/chat and yield parsed upstream events.
@@ -319,6 +344,8 @@ def upstream_stream(messages: list[dict], turnstile_token: str | None = None
     if resp is None and POOL.enabled and tried:
         log.info("all pool proxies failed (%d tried) — falling back to direct",
                  len(tried))
+        if REFRESHER is not None:
+            REFRESHER.wake()  # pool went stale: refresh in the background
         t0 = time.time()
         try:
             resp = _post_chat(messages, turnstile_token, None)
@@ -331,9 +358,16 @@ def upstream_stream(messages: list[dict], turnstile_token: str | None = None
     # CSRF rotation on 419
     if resp.status == 419:
         resp.close()
-        SESSION.get(force=True, proxy=proxy)
+        _session_refresh_resilient(proxy)
         t0 = time.time()
-        resp = _post_chat(messages, turnstile_token, proxy)
+        try:
+            resp = _post_chat(messages, turnstile_token, proxy)
+        except UpstreamError as e:
+            if not proxy:
+                raise
+            log.warning("post-419 retry via %s failed: %s — trying direct",
+                        proxy, str(e)[:120])
+            resp = _post_chat(messages, turnstile_token, None)
 
     def _challenge_like(r: http.client.HTTPResponse) -> bool:
         ctype = r.getheader("Content-Type") or ""
@@ -345,10 +379,17 @@ def upstream_stream(messages: list[dict], turnstile_token: str | None = None
         if err.is_turnstile and not turnstile_token and SOLVER_MODE != "off":
             log.info("turnstile challenge received — minting token (mode=%s)", SOLVER_MODE)
             token = _mint_token()
-            SESSION.get(force=True, proxy=proxy)  # challenge may be session-scoped
+            _session_refresh_resilient(proxy)  # challenge may be session-scoped
             _throttle()
             t0 = time.time()
-            resp = _post_chat(messages, token, proxy)
+            try:
+                resp = _post_chat(messages, token, proxy)
+            except UpstreamError as e:
+                if not proxy:
+                    raise
+                log.warning("post-challenge retry via %s failed: %s — trying direct",
+                            proxy, str(e)[:120])
+                resp = _post_chat(messages, token, None)
             if _challenge_like(resp):
                 err2 = _read_error_body(resp)
                 if err2.is_turnstile:
@@ -360,13 +401,29 @@ def upstream_stream(messages: list[dict], turnstile_token: str | None = None
                 raise err2
         elif err.status == 429 and not err.is_turnstile:
             POOL.report_fail(proxy, hard=False)  # proxy alive, but its IP cap is gone
+            if REFRESHER is not None:
+                REFRESHER.wake()  # need fresh IPs sooner than the next tick
             time.sleep(5)
             _throttle()
-            proxy = POOL.pick(exclude=tried) if POOL.enabled else None
-            if proxy:
-                tried.add(proxy)
+            retry_proxy = POOL.pick(exclude=tried) if POOL.enabled else None
+            if retry_proxy:
+                tried.add(retry_proxy)
+            proxy = retry_proxy
             t0 = time.time()
-            resp = _post_chat(messages, turnstile_token, proxy)
+            try:
+                resp = _post_chat(messages, turnstile_token, retry_proxy)
+            except UpstreamError as e:
+                # every path needs a terminal fallback: if the fresh proxy is
+                # dead too, go direct (worst case the same 429 comes back and
+                # is reported to the client as-is)
+                try:
+                    log.warning("post-429 retry via %s failed: %s — trying direct",
+                                retry_proxy or "direct", str(e)[:120])
+                    resp = _post_chat(messages, turnstile_token, None)
+                except UpstreamError as e2:
+                    raise UpstreamError(502, {
+                        "error": f"post-429 retry failed on proxy and direct: "
+                                 f"{e2.message}"}) from e2
             if _challenge_like(resp):
                 raise _read_error_body(resp)
         else:
@@ -919,6 +976,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "upstream": UPSTREAM_BASE,
                                   "model": UPSTREAM_MODEL, "solver": solver,
                                   "proxy_pool": POOL.stats(),
+                                  "auto_refresh": (REFRESHER.status()
+                                                   if REFRESHER else None),
                                   "throttle_min_interval": MIN_INTERVAL,
                                   "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         elif path in ("/v1/models", "/models"):
@@ -1611,6 +1670,13 @@ def main() -> None:
              solver["mode"], solver["status"], solver.get("backend"))
     if PROXY_POOL_ENABLED:
         log.info("proxy pool: ENABLED %s", POOL.stats())
+        global REFRESHER
+        if PROXY_POOL_AUTO:
+            REFRESHER = ppool.AutoRefresher(
+                POOL, interval=PROXY_POOL_REFRESH_SECS,
+                min_avail=PROXY_POOL_MIN_AVAIL, limit=PROXY_POOL_SCRAPE_LIMIT,
+                concurrency=PROXY_POOL_CHECK_CONCURRENCY,
+                stage2_sample=PROXY_POOL_STAGE2_SAMPLE, log_=log).start()
     log.info("endpoints: GET / | /health | /v1/models  POST /v1/chat/completions | "
              "/v1/messages | /v1/completions")
     if os.environ.get("PROXY_API_KEY"):
