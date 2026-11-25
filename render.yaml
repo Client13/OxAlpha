@@ -1,0 +1,48 @@
+# Render Blueprint — OxAlpha OpenAI-compatible API
+#
+# Deploys the full stack (boterdrop-solver + oxalpha wrapper) as ONE web
+# service behind a single HTTPS URL. The oreo client just needs:
+#   OREO_BASE_URL=https://oxalpha-api.onrender.com/v1
+#   OREO_API_KEY=<value of PROXY_API_KEY>
+#   OREO_MODEL=ox-alpha
+#
+# To host the oreo webapp on the same workspace later, add another service
+# block here (commented example at the bottom) and re-apply the blueprint.
+
+services:
+  - type: web
+    name: oxalpha-api
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: .
+    plan: free            # free sleeps after 15min idle (cold start ~1-2min);
+                          # use "starter" for always-on low latency
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PROXY_API_KEY
+        value: sk-oxalpha-oreo-dummy-key   # dummy key; rotate in the dashboard
+      - key: SOLVER_BASE
+        value: http://127.0.0.1:8001
+      - key: SOLVER_TIMEOUT
+        value: "120"
+      - key: REQUEST_DEADLINE
+        value: "165"
+      - key: STREAM_MAX_SECONDS
+        value: "150"
+
+  # ── Future: the oreo webapp can live in the same blueprint ──────────────
+  # - type: web
+  #   name: oreo-web
+  #   runtime: node
+  #   plan: free
+  #   buildCommand: npm ci && npm run build
+  #   startCommand: npm start
+  #   healthCheckPath: /api/health
+  #   envVars:
+  #     - key: OREO_BASE_URL
+  #       value: https://oxalpha-api.onrender.com/v1
+  #     - key: OREO_API_KEY
+  #       sync: false          # set the same dummy key in the dashboard
+  #     - key: OREO_MODEL
+  #       value: ox-alpha
