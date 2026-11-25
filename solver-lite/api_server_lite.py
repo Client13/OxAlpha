@@ -48,6 +48,15 @@ CHROME_ARGS = [
     "--disable-gpu",
     "--no-first-run",
     "--no-default-browser-check",
+    # small-container RAM discipline (Render free = 512MB):
+    "--renderer-process-limit=1",
+    "--disable-site-isolation-trials",
+    "--js-flags=--max-old-space-size=192",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--mute-audio",
+    "--metrics-recording-only",
 ]
 
 LIMIT_MARKERS = ("reached your daily limit", "rate limit", "too many requests",
@@ -114,7 +123,7 @@ class UIBridge:
                 logger.info("[Lite] Launching Chromium (patchright, persistent)...")
                 self.ctx = await self.pw.chromium.launch_persistent_context(
                     PROFILE, headless=HEADLESS, locale="en-US",
-                    viewport={"width": 1280, "height": 800}, args=CHROME_ARGS)
+                    viewport={"width": 1000, "height": 700}, args=CHROME_ARGS)
             self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
             logger.info("[Lite] Navigating to oxalpha chat...")
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
@@ -134,6 +143,15 @@ class UIBridge:
 
     # ── the chat round-trip ───────────────────────────────────────────────
     async def do_chat(self, text: str, timeout: int) -> str:
+        # Reload per request: keeps the page's DOM/JS memory bounded on small
+        # hosts (a long-lived chat page accumulates hundreds of MB).
+        try:
+            if "oxalpha.com" not in (self.page.url or ""):
+                await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
+            else:
+                await self.page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            await self.recover_page()
         await self.ensure_page()
         page = self.page
         await page.click(".new-chat-btn")
