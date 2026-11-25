@@ -124,6 +124,11 @@ SOLVER_ACTION = os.environ.get("SOLVER_ACTION", "chat")
 # (new chat -> paste -> send -> read reply), which needs no Turnstile token at
 # all and survives on small hosts like Render free tier.
 UPSTREAM_MODE = os.environ.get("UPSTREAM_MODE", "api")
+# Optional secondary line (e.g. the pool-based oxalpha_server deployment):
+# when the UI bridge cannot answer (challenge / down / limit), the request is
+# retried against this OpenAI-compatible endpoint before surfacing an error.
+FALLBACK_BASE = os.environ.get("FALLBACK_BASE", "").rstrip("/")
+FALLBACK_API_KEY = os.environ.get("FALLBACK_API_KEY", "")
 # Server-side guardrails (Render/oreo hardening):
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(8 * 1024 * 1024)))
 # Whole-request ceiling for buffered completions. oreo's provider aborts at
@@ -201,27 +206,54 @@ class UpstreamError(Exception):
         self.payload = payload
 
 
+def _fallback_text(messages: list[dict], timeout: int = 120) -> str:
+    """Second line: an OpenAI-compatible endpoint (pool-based clean server)."""
+    body = json.dumps({"model": "ox-alpha", "messages": messages, "stream": False}).encode()
+    headers = {"Content-Type": "application/json"}
+    if FALLBACK_API_KEY:
+        headers["Authorization"] = "Bearer " + FALLBACK_API_KEY
+    req = urllib.request.Request(FALLBACK_BASE + "/v1/chat/completions", data=body,
+                                 headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout + 15) as r:
+        data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    ch = (data.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    text = str(msg.get("content") or "")
+    if not text.strip():
+        raise ValueError("fallback returned empty content")
+    return text
+
+
 def upstream_ui_text(messages: list[dict], timeout: int = 120) -> str:
-    """Chat through the solver-lite UI bridge; returns the assistant reply."""
+    """Chat through the solver-lite UI bridge; returns the assistant reply.
+    On bridge failure, retries via FALLBACK_BASE (pool line) when configured."""
     body = json.dumps({"messages": messages, "timeout": max(20, min(timeout, 150))}).encode()
     req = urllib.request.Request(SOLVER_BASE.rstrip("/") + "/chat", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
+    primary_err = None
     try:
         with urllib.request.urlopen(req, timeout=timeout + 15) as r:
             data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+        text = str(data.get("text", ""))
+        if text.strip():
+            return text
+        primary_err = UpstreamError(502, {"error": "solver returned empty text"})
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace") or "{}"
         try:
             payload = json.loads(raw)
         except Exception:
             payload = {"error": raw[:300]}
-        raise UpstreamError(e.code if e.code in (429, 502, 504) else 502, payload)
+        primary_err = UpstreamError(e.code if e.code in (429, 502, 504) else 502, payload)
     except Exception as e:
-        raise UpstreamError(502, {"error": f"solver chat unreachable: {e}"})
-    text = str(data.get("text", ""))
-    if not text.strip():
-        raise UpstreamError(502, {"error": "solver returned empty text"})
-    return text
+        primary_err = UpstreamError(502, {"error": f"solver chat unreachable: {e}"})
+    if FALLBACK_BASE:
+        try:
+            return _fallback_text(messages, timeout)
+        except Exception as fe:
+            primary_err.payload = dict(primary_err.payload) if isinstance(primary_err.payload, dict) else {}
+            primary_err.payload["fallback_error"] = f"{type(fe).__name__}: {fe}"[:300]
+    raise primary_err
 
 
 def _ui_sse_iter(text: str):

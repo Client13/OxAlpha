@@ -39,6 +39,10 @@ CHAT_TIMEOUT = int(os.environ.get("LITE_CHAT_TIMEOUT", "150"))
 STABLE_SECS = float(os.environ.get("LITE_STABLE_SECS", "2.5"))
 HEADLESS = os.environ.get("LITE_HEADLESS", "0").lower() in ("1", "true", "yes")
 PROFILE = os.environ.get("LITE_PROFILE", "/tmp/lite-profile")
+# Close the whole browser after every chat: a finished page still holds
+# hundreds of MB and OOM-kills 512MB containers minutes later. Each request
+# then pays ~10s extra page-load, but RAM stays bounded. Set 0 on fat hosts.
+CLOSE_AFTER = os.environ.get("LITE_CLOSE_AFTER", "0").lower() in ("1", "true", "yes")
 
 CHAT_URL = "https://oxalpha.com/chat/"
 CHROME_ARGS = [
@@ -129,6 +133,17 @@ class UIBridge:
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2)
             logger.success("[Lite] Chat page ready")
+
+    async def close_all(self):
+        """Tear the whole context/browser down to free RAM (CLOSE_AFTER=1)."""
+        try:
+            if self.ctx is not None:
+                await self.ctx.close()
+        except Exception:
+            pass
+        self.ctx = None
+        self.page = None
+        logger.success("[Lite] browser closed after chat (RAM freed)")
 
     async def recover_page(self):
         """Hard reset: close and relaunch the page."""
@@ -254,8 +269,12 @@ class UIBridge:
         except Exception as e:
             logger.error(f"[Lite] chat failed: {type(e).__name__}: {e}")
             asyncio.create_task(self.recover_page())
+            if CLOSE_AFTER:
+                await self.close_all()
             return JSONResponse(content={"error": f"{type(e).__name__}: {e}"[:300]},
                                 status_code=502)
+        if CLOSE_AFTER:
+            await self.close_all()
         elapsed = round(time.time() - t0, 2)
         low = reply.lower()
         if any(m in low for m in LIMIT_MARKERS) and len(reply) < 200:

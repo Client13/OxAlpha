@@ -28,6 +28,7 @@ RUN chmod +x /app/deploy/start.sh
 ENV SOLVER_BASE=http://127.0.0.1:8001 \
     UPSTREAM_MODE=ui \
     SOLVER_IMPL=lite \
+    LITE_CLOSE_AFTER=1 \
     PROXY_API_KEY=sk-oxalpha-oreo-dummy-key
 
 EXPOSE 10000
