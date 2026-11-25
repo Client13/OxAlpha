@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # OxAlpha — OpenAI-compatible API (solver + wrapper)
 
 Turns the free OxAlpha web chat into a **stable OpenAI-compatible API**:
@@ -75,7 +74,11 @@ cd oxalpha-proxy && PROXY_API_KEY=sk-oxalpha-oreo-dummy-key \
 | `render.yaml` | Render blueprint (add the oreo webapp here later) |
 
 Use responsibly: oxalpha.com is a free, rate-limited demo; this proxy is for personal/low-volume use.
-=======
+
+---
+
+# Parallel line: `oxalpha_server.py` clean rebuild (also in this repo)
+
 # 0xalpha — clean rebuild
 
 One stdlib-only Python service that turns the free **oxalpha.com** chat upstream
@@ -302,30 +305,3 @@ reached` errors, the cap for today's IP is used up — the proxy surfaces it
 correctly in both OpenAI and Anthropic error shapes; re-run tomorrow or from
 another IP. (All 74 checks were recorded passing on a fresh quota, including
 the Codex CLI and Claude Code end-to-end runs.)
->>>>>>> origin/main
-
----
-
-## Parallel line: `oxalpha_server.py` (clean rebuild, also in this repo)
-
-A second, independent implementation lives at the repo root — a **single-file,
-stdlib-only** server (`oxalpha_server.py`) speaking **OpenAI + OpenAI Responses
-+ Anthropic Messages** APIs, with its own patchright-based Turnstile solver
-(`turnstile_solver.py`), an upstream **proxy pool** (`proxy_pool.py` +
-`proxies_seed.json`) and a 74-check suite (`test_oxalpha.py`). Run it with:
-
-```bash
-python3 oxalpha_server.py                 # :8000
-./start.sh                                # same, PORT/HOST env aware
-```
-
-Its Render blueprint strategy (SOLVER_MODE=off + PROXY_POOL=1) trades the
-browser for rotating proxies; on this workspace the **UI-bridge Docker
-deployment above is the proven path** (17/17 oreo-contract tests), so the
-Render service builds `deploy/Dockerfile`. Both implementations coexist here;
-pick per host:
-
-| Host | Use |
-| --- | --- |
-| Render free (512MB) | Docker service → `deploy/Dockerfile` (UI bridge) |
-| Fat VPS (2GB+) | either — `SOLVER_IMPL=boterdrop` in Docker, or `oxalpha_server.py` bare |
