@@ -89,7 +89,9 @@ class ClearanceAPIServer:
         # container never holds Firefox RAM while idle. SOLVER_LAZY=0 restores
         # the always-on pool (original behavior, for fat VPS).
         self.lazy = os.environ.get("SOLVER_LAZY", "1").lower() not in ("0", "false", "no")
-        self.lazy_idle_secs = int(os.environ.get("SOLVER_LAZY_IDLE", "90"))
+        self.lazy_idle_secs = int(os.environ.get("SOLVER_LAZY_IDLE", "600"))
+        self.launch_timeout = int(os.environ.get("SOLVER_LAUNCH_TIMEOUT", "420"))
+        self.warm_boot = os.environ.get("SOLVER_WARM_BOOT", "1").lower() not in ("0", "false", "no")
         self._last_used = 0.0
 
         # Modern FastAPI (>=0.103 removed add_event_handler): wrap
@@ -338,12 +340,15 @@ class ClearanceAPIServer:
     async def _initialize_browser(self):
         self._load_proxies()
         if self.lazy:
-            # Standby: no browser process at boot. _ensure_browser() launches
-            # one on the first task and _lazy_idle_loop() closes it again later.
+            # Standby: no browser process at boot. _boot_warm() launches one in
+            # the background right after boot (so the first challenge is fast)
+            # and _lazy_idle_loop() closes it again after an idle gap.
             self._task_sem = asyncio.Semaphore(max(1, self.max_task_num))
             asyncio.create_task(self._cleanup_results())
             asyncio.create_task(self._periodic_cleanup(self.cleanup_interval_minutes))
             asyncio.create_task(self._lazy_idle_loop())
+            if self.warm_boot:
+                asyncio.create_task(self._boot_warm())
             logger.success("[Lazy] Solver standby — browser diluncurkan saat ada tugas")
             return
         self.camoufox = AsyncCamoufox(
@@ -375,46 +380,65 @@ class ClearanceAPIServer:
 
     # ── Lazy-mode helpers (Render 512MB): launch on demand, close on idle ──
 
-    async def _ensure_browser(self):
-        """Lazy mode: make sure a browser + page pool exists before a task.
-        Serializes with restarts/cleanup via _pool_lock."""
+    async def _ensure_browser(self, wait_pool: int = 90):
+        """Lazy mode: make sure a browser + a free pool page exist before a task.
+
+        Slow-host safe (Render free = 0.1 CPU): if a launch is already in
+        flight, WAIT for its pool instead of returning early and failing with
+        'no free page'; the launcher itself is bounded by SOLVER_LAUNCH_TIMEOUT.
+        """
         if not self.lazy:
             return
-        try:
-            connected = bool(self.browser is not None and self.browser.is_connected())
-        except Exception:
-            connected = False
-        if connected:
-            self._last_used = time.time()
-            return
-        async with self._pool_lock:
-            if self._restarting:
-                return  # another caller is launching right now
-            self._restarting = True
+        deadline = time.time() + wait_pool
+        while True:
             try:
-                if self.browser is not None:
-                    try:
-                        await self.browser.close()
-                    except Exception:
-                        pass
-                    self.browser = None
-                logger.info("[Lazy] Meluncurkan browser untuk tugas...")
-                self.camoufox = AsyncCamoufox(
-                    headless=self.headless,
-                    exclude_addons=[DefaultAddons.UBO],
-                    firefox_user_prefs=_browser_prefs(),
-                    block_images=True,  # solve pages need no images; saves RAM
-                    args=self.browser_args,
-                )
-                self.browser = await self.camoufox.start()
-                await self._build_page_pool()
+                connected = bool(self.browser is not None and self.browser.is_connected())
+            except Exception:
+                connected = False
+            if connected and self.page_pool.qsize() > 0:
                 self._last_used = time.time()
-                logger.success(f"[Lazy] Browser siap ({self.page_pool.qsize()} halaman)")
-            except Exception as e:
-                logger.error(f"[Lazy] Gagal meluncurkan browser: {e}")
-                raise
-            finally:
-                self._restarting = False
+                return
+            launched = False
+            async with self._pool_lock:
+                if self._restarting:
+                    pass  # a launch/close is in flight — just wait below
+                else:
+                    self._restarting = True
+                    launched = True
+            if launched:
+                try:
+                    if self.browser is not None:
+                        try:
+                            await self.browser.close()
+                        except Exception:
+                            pass
+                        self.browser = None
+                    logger.info("[Lazy] Meluncurkan browser untuk tugas...")
+                    self.camoufox = AsyncCamoufox(
+                        headless=self.headless,
+                        exclude_addons=[DefaultAddons.UBO],
+                        firefox_user_prefs=_browser_prefs(),
+                        block_images=True,  # solve pages need no images; saves RAM
+                        args=self.browser_args,
+                    )
+                    try:
+                        self.browser = await asyncio.wait_for(
+                            self.camoufox.start(), timeout=self.launch_timeout)
+                        logger.info("[Lazy] Browser process spawned — membangun pool...")
+                        await asyncio.wait_for(self._build_page_pool(),
+                                               timeout=self.launch_timeout)
+                        self._last_used = time.time()
+                        logger.success(f"[Lazy] Browser siap ({self.page_pool.qsize()} halaman)")
+                    except asyncio.TimeoutError:
+                        raise TimeoutError(
+                            f"browser launch/build exceeded {self.launch_timeout}s")
+                    except Exception:
+                        raise
+                finally:
+                    self._restarting = False
+            if time.time() > deadline:
+                raise TimeoutError("browser/pool not ready in time")
+            await asyncio.sleep(2)
 
     async def _close_browser(self):
         """Lazy mode: tear the browser down again to free RAM."""
@@ -445,6 +469,20 @@ class ClearanceAPIServer:
                 logger.success("[Lazy] Browser ditutup (hemat RAM)")
             finally:
                 self._restarting = False
+
+    async def _boot_warm(self):
+        """Warm the browser right after boot so the first turnstile challenge
+        is fast. Cold launches are slow on 0.1-CPU hosts, so this runs in the
+        background with a generous retry loop."""
+        await asyncio.sleep(5)
+        while True:
+            try:
+                await self._ensure_browser(wait_pool=600)
+                logger.success("[Lazy] Boot warm-up selesai — browser siap")
+                return
+            except Exception as e:
+                logger.warning(f"[Lazy] Boot warm-up gagal ({type(e).__name__}: {e}); retry 60s")
+                await asyncio.sleep(60)
 
     async def _lazy_idle_loop(self):
         """Close the browser after SOLVER_LAZY_IDLE seconds without tasks."""
