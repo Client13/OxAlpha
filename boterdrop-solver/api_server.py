@@ -84,6 +84,13 @@ class ClearanceAPIServer:
         self._pool_lock = asyncio.Lock()
         self._restarting = False
         self._task_sem: asyncio.Semaphore | None = None
+        # Lazy mode (Render free tier = 512MB): no browser at boot — launch on
+        # demand when a task arrives, close again after an idle gap so the
+        # container never holds Firefox RAM while idle. SOLVER_LAZY=0 restores
+        # the always-on pool (original behavior, for fat VPS).
+        self.lazy = os.environ.get("SOLVER_LAZY", "1").lower() not in ("0", "false", "no")
+        self.lazy_idle_secs = int(os.environ.get("SOLVER_LAZY_IDLE", "90"))
+        self._last_used = 0.0
 
         # Modern FastAPI (>=0.103 removed add_event_handler): wrap
         # startup/shutdown in a lifespan context so this works on both
@@ -314,8 +321,15 @@ class ClearanceAPIServer:
             connected = bool(self.browser is not None and self.browser.is_connected())
         except Exception:
             connected = False
+        if connected:
+            status = "ok"
+        elif self.lazy:
+            status = "standby"  # lazy mode: browser intentionally not running
+        else:
+            status = "degraded"
         return JSONResponse(content={
-            "status": "ok" if connected else "degraded",
+            "status": status,
+            "mode": "lazy" if self.lazy else "always",
             "browser_connected": connected,
             "pool": self.page_pool.qsize(),
             "capacity": self.max_task_num,
@@ -323,6 +337,15 @@ class ClearanceAPIServer:
 
     async def _initialize_browser(self):
         self._load_proxies()
+        if self.lazy:
+            # Standby: no browser process at boot. _ensure_browser() launches
+            # one on the first task and _lazy_idle_loop() closes it again later.
+            self._task_sem = asyncio.Semaphore(max(1, self.max_task_num))
+            asyncio.create_task(self._cleanup_results())
+            asyncio.create_task(self._periodic_cleanup(self.cleanup_interval_minutes))
+            asyncio.create_task(self._lazy_idle_loop())
+            logger.success("[Lazy] Solver standby — browser diluncurkan saat ada tugas")
+            return
         self.camoufox = AsyncCamoufox(
             headless=self.headless,
             exclude_addons=[DefaultAddons.UBO],
@@ -349,6 +372,97 @@ class ClearanceAPIServer:
             for _ in range(self.page_count):
                 page = await context.new_page()
                 await self.page_pool.put((page, context))
+
+    # ── Lazy-mode helpers (Render 512MB): launch on demand, close on idle ──
+
+    async def _ensure_browser(self):
+        """Lazy mode: make sure a browser + page pool exists before a task.
+        Serializes with restarts/cleanup via _pool_lock."""
+        if not self.lazy:
+            return
+        try:
+            connected = bool(self.browser is not None and self.browser.is_connected())
+        except Exception:
+            connected = False
+        if connected:
+            self._last_used = time.time()
+            return
+        async with self._pool_lock:
+            if self._restarting:
+                return  # another caller is launching right now
+            self._restarting = True
+            try:
+                if self.browser is not None:
+                    try:
+                        await self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = None
+                logger.info("[Lazy] Meluncurkan browser untuk tugas...")
+                self.camoufox = AsyncCamoufox(
+                    headless=self.headless,
+                    exclude_addons=[DefaultAddons.UBO],
+                    firefox_user_prefs=_browser_prefs(),
+                    block_images=True,  # solve pages need no images; saves RAM
+                    args=self.browser_args,
+                )
+                self.browser = await self.camoufox.start()
+                await self._build_page_pool()
+                self._last_used = time.time()
+                logger.success(f"[Lazy] Browser siap ({self.page_pool.qsize()} halaman)")
+            except Exception as e:
+                logger.error(f"[Lazy] Gagal meluncurkan browser: {e}")
+                raise
+            finally:
+                self._restarting = False
+
+    async def _close_browser(self):
+        """Lazy mode: tear the browser down again to free RAM."""
+        async with self._pool_lock:
+            if self._restarting:
+                return
+            self._restarting = True
+            try:
+                old_contexts = list(self.contexts)
+                self.contexts = []
+                try:
+                    while True:
+                        self.page_pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                for ctx in old_contexts:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+                if self.browser is not None:
+                    try:
+                        await self.browser.close()
+                    except Exception:
+                        pass
+                    self.browser = None
+                self.camoufox = None
+                logger.success("[Lazy] Browser ditutup (hemat RAM)")
+            finally:
+                self._restarting = False
+
+    async def _lazy_idle_loop(self):
+        """Close the browser after SOLVER_LAZY_IDLE seconds without tasks."""
+        while True:
+            await asyncio.sleep(15)
+            if not self.lazy or self.browser is None:
+                continue
+            idle = time.time() - self._last_used
+            if idle < self.lazy_idle_secs:
+                continue
+            try:
+                connected = bool(self.browser.is_connected())
+            except Exception:
+                connected = False
+            if not connected or self.page_pool.qsize() < self.max_task_num:
+                continue  # tasks in flight — keep the browser
+            logger.info(f"[Lazy] Idle {int(idle)}s — menutup browser untuk hemat RAM")
+            await self._close_browser()
 
     async def _cleanup_results(self):
         """Bersihkan hasil (success/error) yang sudah > 10 menit belum diambil.
@@ -402,6 +516,8 @@ class ClearanceAPIServer:
 
         while True:
             await asyncio.sleep(interval_minutes * 60)
+            if self.browser is None:  # lazy standby / closed: nothing to clean
+                continue
             logger.info(f"[Cleanup] Memulai FORCED cleanup (interval: {interval_minutes} menit)...")
 
             # Fase 1: Drain semua page dari pool secara non-blocking
@@ -578,6 +694,8 @@ class ClearanceAPIServer:
         start_time = time.time()
         page = context = None
         try:
+            if self.lazy:
+                await self._ensure_browser()
             page, context = await self._get_page()
         except self._PoolExhausted as e:
             self.results[task_id] = {"status": "error", "elapsed_time": round(time.time() - start_time, 3),
@@ -702,6 +820,8 @@ class ClearanceAPIServer:
         start_time = time.time()
         page = context = None
         try:
+            if self.lazy:
+                await self._ensure_browser()
             page, context = await self._get_page()
         except self._PoolExhausted as e:
             self.results[task_id] = {"status": "error", "elapsed_time": round(time.time() - start_time, 3),
@@ -804,6 +924,8 @@ class ClearanceAPIServer:
         start_time = time.time()
         page = context = None
         try:
+            if self.lazy:
+                await self._ensure_browser()
             page, context = await self._get_page()
         except self._PoolExhausted as e:
             self.results[task_id] = {"status": "error", "elapsed_time": round(time.time() - start_time, 3),
@@ -1170,7 +1292,7 @@ class ClearanceAPIServer:
         if not url or not sitekey:
             raise HTTPException(status_code=400, detail={"status": "error", "error": "Parameter 'url' dan 'sitekey' wajib diisi"})
 
-        if self.page_pool.qsize() == 0:
+        if not self.lazy and self.page_pool.qsize() == 0:
             return JSONResponse(content={"status": "error", "error": "Server penuh, coba lagi nanti"}, status_code=429)
 
         task_id = str(uuid.uuid4())
@@ -1198,7 +1320,7 @@ class ClearanceAPIServer:
         if not url:
             raise HTTPException(status_code=400, detail={"status": "error", "error": "Parameter 'url' wajib diisi"})
 
-        if self.page_pool.qsize() == 0:
+        if not self.lazy and self.page_pool.qsize() == 0:
             return JSONResponse(content={"status": "error", "error": "Server penuh, coba lagi nanti"}, status_code=429)
 
         task_id = str(uuid.uuid4())
@@ -1222,7 +1344,7 @@ class ClearanceAPIServer:
         if not url:
             raise HTTPException(status_code=400, detail={"status": "error", "error": "Parameter 'url' wajib diisi"})
 
-        if self.page_pool.qsize() == 0:
+        if not self.lazy and self.page_pool.qsize() == 0:
             return JSONResponse(content={"status": "error", "error": "Server penuh, coba lagi nanti"}, status_code=429)
 
         task_id = str(uuid.uuid4())
