@@ -54,12 +54,11 @@ import logging
 import os
 import re
 import secrets
+import ssl
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Generator
 
@@ -146,10 +145,9 @@ class SessionManager:
         with self._lock:
             if not force and self._csrf and time.time() - self._at < SESSION_TTL:
                 return {"cookies": dict(self._cookies), "csrf": self._csrf}
-            req = urllib.request.Request(UPSTREAM_BASE + "/chat",
-                                         headers={"User-Agent": BROWSER_UA})
             try:
-                with _open_url(req, proxy, 30) as resp:
+                with _open_url("GET", "/chat", None,
+                               {"User-Agent": BROWSER_UA}, proxy, 30) as resp:
                     cookies = self._parse_cookies(resp.headers)
                     html = resp.read().decode("utf-8", "replace")
             except Exception as e:
@@ -189,18 +187,41 @@ POOL = ppool.ProxyPool(PROXY_POOL_FILE, enabled=PROXY_POOL_ENABLED)
 if PROXY_POOL_ENABLED:
     POOL.load()
 
+_ssl_ctx = ssl.create_default_context()
+PROXY_CONNECT_TIMEOUT = float(os.environ.get("PROXY_CONNECT_TIMEOUT", "8"))
+UPSTREAM_READ_TIMEOUT = float(os.environ.get("UPSTREAM_READ_TIMEOUT", "180"))
 
-def _open_url(req: urllib.request.Request, proxy: str | None, timeout: float
-              ) -> http.client.HTTPResponse:
-    """Open an upstream request, optionally through a pool proxy (HTTPS
-    CONNECT). Returns the http.client.HTTPResponse for incremental SSE reads."""
+
+def _open_url(method: str, url_path: str, body: bytes | None, headers: dict,
+              proxy: str | None, timeout: float) -> http.client.HTTPResponse:
+    """POST/GET against the upstream, optionally through an HTTP proxy.
+
+    Proxied requests get a SHORT connect+tunnel+response-header budget
+    (PROXY_CONNECT_TIMEOUT — dead free proxies fail fast) and switch to the
+    full `timeout` only for streaming the body afterwards. Direct requests
+    use `timeout` throughout."""
     if proxy:
-        handler = urllib.request.ProxyHandler(
-            {"http": f"http://{proxy}", "https": f"http://{proxy}"})
-    else:
-        handler = urllib.request.ProxyHandler({})  # direct, ignore env proxies
-    opener = urllib.request.build_opener(handler)
-    return opener.open(req, timeout=timeout)
+        host, _, port = proxy.partition(":")
+        conn = http.client.HTTPSConnection(host, int(port or 80),
+                                           timeout=PROXY_CONNECT_TIMEOUT,
+                                           context=_ssl_ctx)
+        try:
+            conn.set_tunnel(UPSTREAM_HOST, 443)
+            conn.request(method, url_path, body=body, headers=headers)
+            resp = conn.getresponse()
+            if conn.sock:
+                conn.sock.settimeout(timeout)
+            return resp
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+    conn = http.client.HTTPSConnection(UPSTREAM_HOST, 443, timeout=timeout,
+                                       context=_ssl_ctx)
+    conn.request(method, url_path, body=body, headers=headers)
+    return conn.getresponse()
 
 
 def _build_headers(sess: dict, token: str | None) -> dict[str, str]:
@@ -222,12 +243,12 @@ def _post_chat(messages: list[dict], token: str | None,
                proxy: str | None = None) -> http.client.HTTPResponse:
     body = json.dumps({"model": UPSTREAM_MODEL, "messages": messages}).encode()
     sess = SESSION.get(proxy=proxy)
-    req = urllib.request.Request(UPSTREAM_BASE + "/api/chat", data=body,
-                                 headers=_build_headers(sess, token), method="POST")
     try:
-        return _open_url(req, proxy, 180)
+        return _open_url("POST", "/api/chat", body, _build_headers(sess, token),
+                         proxy, UPSTREAM_READ_TIMEOUT)
     except Exception as e:
-        raise UpstreamError(502, {"error": f"could not reach upstream: {e}"}) from e
+        raise UpstreamError(502, {"error": f"could not reach upstream "
+                                           f"(via {proxy or 'direct'}): {e}"}) from e
 
 
 def _read_error_body(resp: http.client.HTTPResponse) -> UpstreamError:
