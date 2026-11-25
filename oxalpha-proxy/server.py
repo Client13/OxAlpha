@@ -96,6 +96,7 @@ import re
 import socketserver
 import ssl
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -118,6 +119,11 @@ TURNSTILE_URL = "https://oxalpha.com/chat/"
 SOLVER_BASE = os.environ.get("SOLVER_BASE", "http://127.0.0.1:8001").rstrip("/")
 SOLVER_TIMEOUT = int(os.environ.get("SOLVER_TIMEOUT", "150"))
 SOLVER_ACTION = os.environ.get("SOLVER_ACTION", "chat")
+# Transport: "api" = oxalpha /api/chat + Turnstile auto-solve (og behavior,
+# needs a browser in the solver); "ui" = solver-lite drives the REAL web app
+# (new chat -> paste -> send -> read reply), which needs no Turnstile token at
+# all and survives on small hosts like Render free tier.
+UPSTREAM_MODE = os.environ.get("UPSTREAM_MODE", "api")
 # Server-side guardrails (Render/oreo hardening):
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(8 * 1024 * 1024)))
 # Whole-request ceiling for buffered completions. oreo's provider aborts at
@@ -195,16 +201,62 @@ class UpstreamError(Exception):
         self.payload = payload
 
 
+def upstream_ui_text(messages: list[dict], timeout: int = 120) -> str:
+    """Chat through the solver-lite UI bridge; returns the assistant reply."""
+    body = json.dumps({"messages": messages, "timeout": max(20, min(timeout, 150))}).encode()
+    req = urllib.request.Request(SOLVER_BASE.rstrip("/") + "/chat", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout + 15) as r:
+            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace") or "{}"
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {"error": raw[:300]}
+        raise UpstreamError(e.code if e.code in (429, 502, 504) else 502, payload)
+    except Exception as e:
+        raise UpstreamError(502, {"error": f"solver chat unreachable: {e}"})
+    text = str(data.get("text", ""))
+    if not text.strip():
+        raise UpstreamError(502, {"error": "solver returned empty text"})
+    return text
+
+
+def _ui_sse_iter(text: str):
+    """Synthesize OpenRouter-style SSE lines from a full UI reply so the
+    streaming and buffered consumers need no changes."""
+    created = int(time.time())
+    uid = f"chatcmpl-ui-{created}"
+
+    def chunk(delta, finish=None):
+        return "data: " + json.dumps({"id": uid, "object": "chat.completion.chunk",
+                                      "created": created,
+                                      "choices": [{"index": 0, "delta": delta,
+                                                   "finish_reason": finish}]})
+    buf = ""
+    for part in re.findall(r"\S+\s*", text):
+        buf += part
+        if len(buf) >= 24:
+            yield chunk({"content": buf})
+            buf = ""
+    if buf:
+        yield chunk({"content": buf})
+    yield chunk({}, finish="stop")
+    yield "data: [DONE]"
+
+
 def upstream_chat_stream(
     messages: list[dict],
     turnstile_token: str | None = None,
     timeout: int = 120,
 ):
-    """
-    POST /api/chat, yield raw SSE lines (str, without trailing newline).
-    Raises UpstreamError on non-2xx JSON errors (incl. turnstile_required).
-    Caller must iterate to completion; connection closed at the end.
-    """
+    """POST /api/chat (api mode) or the UI bridge (ui mode), yield raw SSE
+    lines (str, without trailing newline). Raises UpstreamError on failures.
+    Caller must iterate to completion; connection closed at the end."""
+    if UPSTREAM_MODE == "ui":
+        return _ui_sse_iter(upstream_ui_text(messages, timeout)), {}
     sess = upstream_init_session()
     body = json.dumps({"model": UPSTREAM_MODEL, "messages": messages}).encode()
     headers = {
@@ -888,7 +940,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif path == "/health":
             health: dict[str, Any] = {"status": "ok", "upstream": UPSTREAM_BASE,
-                                      "model": UPSTREAM_MODEL}
+                                      "model": UPSTREAM_MODEL, "mode": UPSTREAM_MODE}
             if SOLVER_BASE:
                 health["solver"] = {"base": SOLVER_BASE,
                                     **solver_health(SOLVER_BASE)}

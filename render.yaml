@@ -30,6 +30,10 @@ services:
         value: "165"
       - key: STREAM_MAX_SECONDS
         value: "150"
+      - key: UPSTREAM_MODE
+        value: ui    # solver drives the real web app (no Turnstile needed)
+      - key: SOLVER_IMPL
+        value: lite  # patchright+chromium; "boterdrop" = og camoufox solver
 
   # ── Future: the oreo webapp can live in the same blueprint ──────────────
   # - type: web
