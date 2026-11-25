@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+proxies.json
+!proxies_seed.json
+proxies_full.txt
+debug_logs/
+agent_workspace/
+*.log

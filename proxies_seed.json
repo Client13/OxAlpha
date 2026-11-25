@@ -1,0 +1,148 @@
+{
+ "updated": "2026-11-25T21:29:23.428751+00:00",
+ "proxies": [
+  {
+   "proxy": "134.209.29.120:3128",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 904,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "103.147.247.169:8080",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 2215,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "103.226.127.3:10080",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 2595,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "103.227.187.11:6090",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 2745,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "58.27.213.133:8080",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 2973,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "165.101.231.92:8090",
+   "state": "ok",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 3569,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "12.218.209.130:53281",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 3803,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "178.253.38.101:10808",
+   "state": "ok",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 4279,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "103.159.195.221:8080",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 5702,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "201.4.69.46:8080",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 5871,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "170.150.117.232:8080",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 6016,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "186.38.100.130:999",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 7746,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  },
+  {
+   "proxy": "38.156.14.66:999",
+   "state": "unverified",
+   "ok": 0,
+   "fail": 0,
+   "consec_fail": 0,
+   "latency_ms": 7925,
+   "last_ok": 0.0,
+   "last_fail": 0.0,
+   "cooldown_until": 0.0
+  }
+ ]
+}
