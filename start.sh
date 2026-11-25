@@ -11,7 +11,8 @@
 # - Both components log to stdout so failures are visible in Render logs.
 set -u
 
-mkdir -p /tmp/logs /tmp/lite-profile
+mkdir -p /tmp/logs
+rm -rf /tmp/lite-profile-* 2>/dev/null || true   # stale locks from a crashed browser
 
 # Virtual display for headed Chromium (patchright stealth requirement)
 Xvfb :99 -screen 0 1280x800x24 > /dev/null 2>&1 &

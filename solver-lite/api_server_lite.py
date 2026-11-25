@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import time
 
 import uvicorn
@@ -38,7 +39,7 @@ LITE_PORT = int(os.environ.get("LITE_PORT", "8001"))
 CHAT_TIMEOUT = int(os.environ.get("LITE_CHAT_TIMEOUT", "150"))
 STABLE_SECS = float(os.environ.get("LITE_STABLE_SECS", "2.5"))
 HEADLESS = os.environ.get("LITE_HEADLESS", "0").lower() in ("1", "true", "yes")
-PROFILE = os.environ.get("LITE_PROFILE", "/tmp/lite-profile")
+PROFILE = os.environ.get("LITE_PROFILE") or f"/tmp/lite-profile-{os.getpid()}"
 # Close the whole browser after every chat: a finished page still holds
 # hundreds of MB and OOM-kills 512MB containers minutes later. Each request
 # then pays ~10s extra page-load, but RAM stays bounded. Set 0 on fat hosts.
@@ -125,9 +126,18 @@ class UIBridge:
                 self.pw = await async_playwright().start()
             if self.ctx is None:
                 logger.info("[Lite] Launching Chromium (patchright, persistent)...")
-                self.ctx = await self.pw.chromium.launch_persistent_context(
-                    PROFILE, headless=HEADLESS, locale="en-US",
-                    viewport={"width": 1000, "height": 700}, args=CHROME_ARGS)
+                try:
+                    self.ctx = await self.pw.chromium.launch_persistent_context(
+                        PROFILE, headless=HEADLESS, locale="en-US",
+                        viewport={"width": 1000, "height": 700}, args=CHROME_ARGS)
+                except Exception as e:
+                    # stale profile lock (crashed previous browser) kills every
+                    # retry: wipe the profile dir and try once more
+                    logger.warning(f"[Lite] launch failed ({type(e).__name__}); wiping profile, retrying once")
+                    shutil.rmtree(PROFILE, ignore_errors=True)
+                    self.ctx = await self.pw.chromium.launch_persistent_context(
+                        PROFILE, headless=HEADLESS, locale="en-US",
+                        viewport={"width": 1000, "height": 700}, args=CHROME_ARGS)
             self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
             logger.info("[Lite] Navigating to oxalpha chat...")
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
